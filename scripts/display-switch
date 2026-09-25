@@ -1,0 +1,97 @@
+#!/bin/sh
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+CONFIG="$ROOT/.local/config/mac.conf"
+BACKEND=${MONITOR_SWITCH_BIN:-"$ROOT/.local/bin/monitor-switch"}
+M1DDC=${M1DDC_BIN:-"$ROOT/.local/bin/m1ddc"}
+
+usage() {
+    echo 'usage: display-switch {mac|pc|status|toggle}' >&2
+    exit 2
+}
+fail() {
+    echo "error: $*" >&2
+    exit 1
+}
+log() {
+    echo "$(date '+%Y-%m-%dT%H:%M:%S%z') $*" >&2
+}
+
+[ "$#" -eq 1 ] || usage
+case "$1" in mac|pc|status|toggle) COMMAND=$1 ;; *) usage ;; esac
+[ -r "$CONFIG" ] || fail "missing $CONFIG (copy config/mac.example.conf and edit it)"
+# shellcheck source=../config/mac.example.conf
+. "$CONFIG"
+[ -n "${DISPLAY_SELECTOR:-}" ] && [ "$DISPLAY_SELECTOR" != 'REPLACE_WITH_DISPLAY_NAME' ] || fail 'set DISPLAY_SELECTOR in .local/config/mac.conf'
+case "${MAC_VCP:-}" in 0x[0-9a-fA-F][0-9a-fA-F]) ;; *) fail 'set MAC_VCP to a measured 0xNN value' ;; esac
+case "${PC_VCP:-}" in 0x[0-9a-fA-F][0-9a-fA-F]) ;; *) fail 'set PC_VCP to a measured 0xNN value' ;; esac
+MAC_VCP=$(printf '%s' "$MAC_VCP" | tr 'A-F' 'a-f')
+PC_VCP=$(printf '%s' "$PC_VCP" | tr 'A-F' 'a-f')
+[ "$MAC_VCP" != "$PC_VCP" ] || fail 'MAC_VCP and PC_VCP must differ'
+[ -x "$BACKEND" ] || fail "Monitor Switch CLI missing: $BACKEND; run scripts/install-mac-backend.sh"
+
+DISPLAYS=$("$BACKEND" displays) || fail 'display discovery failed'
+MATCHES=$(printf '%s\n' "$DISPLAYS" | awk -F '\t' -v target="$DISPLAY_SELECTOR" '$3 == target {count++} END {print count+0}')
+[ "$MATCHES" -eq 1 ] || fail "expected exactly one $DISPLAY_SELECTOR display, found $MATCHES; refusing to choose another display"
+
+read_current() {
+    OUTPUT=$("$BACKEND" current --display "$DISPLAY_SELECTOR") || fail "cannot read VCP 0x60 from $DISPLAY_SELECTOR"
+    VALUE=$(printf '%s\n' "$OUTPUT" | sed -n 's/^current input source: \(0x[0-9a-fA-F]*\)$/\1/p' | tr 'A-F' 'a-f')
+    [ -n "$VALUE" ] || fail "unexpected current-input response: $OUTPUT"
+    printf '%s\n' "$VALUE"
+}
+
+CURRENT=$(read_current)
+case "$COMMAND" in
+    status)
+        case "$CURRENT" in
+            "$MAC_VCP") echo "mac $CURRENT" ;;
+            "$PC_VCP") echo "pc $CURRENT" ;;
+            *) echo "unknown $CURRENT" ;;
+        esac
+        exit 0 ;;
+    toggle)
+        case "$CURRENT" in
+            "$MAC_VCP") TARGET=$PC_VCP; LABEL=pc ;;
+            "$PC_VCP") TARGET=$MAC_VCP; LABEL=mac ;;
+            *) fail "cannot toggle unknown current input $CURRENT" ;;
+        esac ;;
+    mac) TARGET=$MAC_VCP; LABEL=mac ;;
+    pc) TARGET=$PC_VCP; LABEL=pc ;;
+esac
+
+if [ "$CURRENT" = "$TARGET" ]; then
+    log "already on $LABEL ($CURRENT); no write sent"
+    exit 0
+fi
+
+[ "${SWITCHING_ENABLED:-0}" = '1' ] || fail 'input writes are disabled after the black-screen incident; status remains available'
+
+if [ "$LABEL" = 'pc' ]; then
+    [ -x "$M1DDC" ] || fail "m1ddc CLI missing: $M1DDC; run scripts/install-mac-m1ddc.sh"
+    [ -n "${M1DDC_DISPLAY_UUID:-}" ] && [ "$M1DDC_DISPLAY_UUID" != 'REPLACE_WITH_UUID' ] || fail 'set M1DDC_DISPLAY_UUID in .local/config/mac.conf'
+    case "${PC_M1DDC_VALUE:-}" in ''|*[!0-9]*) fail 'set PC_M1DDC_VALUE to the decimal value of PC_VCP' ;; esac
+    [ "$PC_M1DDC_VALUE" -eq "$((PC_VCP))" ] || fail 'PC_M1DDC_VALUE must equal PC_VCP in decimal'
+    log "sending VCP 0x60=$TARGET via m1ddc to $DISPLAY_SELECTOR ($CURRENT -> $LABEL)"
+    if ! "$M1DDC" display "$M1DDC_DISPLAY_UUID" set input "$PC_M1DDC_VALUE"; then
+        fail "m1ddc write failed; input state may have changed, check status before retrying"
+    fi
+else
+    fail 'Mac-side DDC return to Type C caused a black screen; use the active Windows host or manual OSD'
+fi
+ATTEMPT=1
+AFTER='unavailable'
+while [ "$ATTEMPT" -le 4 ]; do
+    sleep 1
+    if AFTER=$(read_current); then
+        if [ "$AFTER" = "$TARGET" ]; then
+            log "verified $LABEL ($AFTER)"
+            exit 0
+        fi
+    else
+        AFTER='unavailable'
+    fi
+    ATTEMPT=$((ATTEMPT + 1))
+done
+fail "write sent, but read-back was $AFTER after 4 seconds; verify display before retrying"

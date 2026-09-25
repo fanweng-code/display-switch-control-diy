@@ -1,0 +1,4 @@
+* text=auto
+*.sh text eol=lf
+scripts/display-switch text eol=lf
+*.conf text eol=lf
